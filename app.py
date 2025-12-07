@@ -2,6 +2,29 @@ import io
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
+
+
+def format_sheet(ws):
+    """
+    פריסת עמוד מימין לשמאל + יישור לימין + סינון בשורה הראשונה
+    """
+    ws.sheet_view.rightToLeft = True
+
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+    # יישור לימין לכל התאים עם ערך
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.alignment = Alignment(horizontal="right")
+
+    # AutoFilter על שורה 1 לכל העמודות
+    if max_row >= 1 and max_col >= 1:
+        first_col = get_column_letter(1)
+        last_col = get_column_letter(max_col)
+        ws.auto_filter.ref = f"{first_col}1:{last_col}{max_row}"
 
 
 def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
@@ -25,9 +48,19 @@ def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
     matching_ref1_col = matching_headers.get("אסמכתא 1")
     matching_match_col = matching_headers.get("מס. התאמה")
 
+    if None in (
+        bank_amount_col,
+        bank_ref_col,
+        matching_amount_col,
+        matching_ref2_col,
+        matching_ref1_col,
+        matching_match_col,
+    ):
+        raise ValueError("אחת מעמודות המפתח לא נמצאה – בדקי שמות כותרות בעברית בשני הקבצים.")
+
     found_map = {}
 
-    # כלל 1 – סכום + אסמכתא 2
+    # ---------- כלל 1 – סכום + אסמכתא 2 ----------
     for row in range(2, bank_ws.max_row + 1):
         bank_amount = bank_ws.cell(row=row, column=bank_amount_col).value
         bank_ref_val = bank_ws.cell(row=row, column=bank_ref_col).value
@@ -45,6 +78,7 @@ def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
             m_ref2 = str(m_ref2_val).strip() if m_ref2_val is not None else ""
             m_match = matching_ws.cell(row=m_row, column=matching_match_col).value
 
+            # לא דורכים על התאמות קיימות
             if m_match != 0:
                 continue
 
@@ -55,16 +89,17 @@ def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
 
         found_map[row] = 1 if found else 0
 
+    # הוספת עמודה בבנק – נמצא / לא נמצא
     result_col = bank_ws.max_column + 1
     bank_ws.cell(row=1, column=result_col).value = "נמצא במשטח התאמות"
 
     for row in range(2, bank_ws.max_row + 1):
         bank_ws.cell(row=row, column=result_col).value = found_map.get(row, 0)
 
-    # כלל 2 – סכום + אסמכתא 1
+    # ---------- כלל 2 – סכום + אסמכתא 1 ----------
     for row in range(2, bank_ws.max_row + 1):
         if bank_ws.cell(row=row, column=result_col).value == 1:
-            continue
+            continue  # כבר נמצא בכלל 1
 
         bank_amount = bank_ws.cell(row=row, column=bank_amount_col).value
         bank_ref_val = bank_ws.cell(row=row, column=bank_ref_col).value
@@ -87,14 +122,14 @@ def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
                 bank_ws.cell(row=row, column=result_col).value = 1
                 break
 
-    bank_ws.sheet_view.rightToLeft = True
-    for row in bank_ws.iter_rows():
-        for cell in row:
-            if cell.value is not None:
-                cell.alignment = Alignment(horizontal="right")
+    # פורמט לכל הגיליונות שנעבוד איתם
+    format_sheet(bank_ws)       # גיליון מקור מהבנק
+    format_sheet(matching_ws)   # משטח התאמות
 
+    # ---------- בניית קובץ תוצאה ----------
     result_wb = matching_wb
 
+    # מחיקה אם כבר קיים גיליון בשם הזה
     if "פירוט שקים מהבנק" in result_wb.sheetnames:
         result_wb.remove(result_wb["פירוט שקים מהבנק"])
 
@@ -104,24 +139,32 @@ def match_checks(bank_bytes: bytes, matching_bytes: bytes) -> bytes:
     for row in bank_ws.iter_rows(values_only=True):
         bank_copy_ws.append(row)
 
+    # פורמט גם לגיליון ההעתקה
+    format_sheet(bank_copy_ws)
+
     output = io.BytesIO()
     result_wb.save(output)
     output.seek(0)
     return output.getvalue()
 
 
+# ---------- UI של Streamlit ----------
 st.title("התאמת שקים מהבנק מול משטח התאמות")
 
-bank_file = st.file_uploader("העלי פירוט שקים מהבנק", type=["xlsx"])
-matching_file = st.file_uploader("העלי משטח עבודה לניתוח כרטיסים", type=["xlsx"])
+bank_file = st.file_uploader("העלי פירוט שקים מהבנק (Excel)", type=["xlsx"])
+matching_file = st.file_uploader("העלי משטח עבודה לניתוח כרטיסים (Excel)", type=["xlsx"])
 
 if bank_file and matching_file:
     if st.button("הרץ התאמה"):
-        result_bytes = match_checks(bank_file.read(), matching_file.read())
+        try:
+            result_bytes = match_checks(bank_file.read(), matching_file.read())
+            st.success("ההתאמה הסתיימה בהצלחה ✔")
 
-        st.download_button(
-            label="הורדת קובץ תוצאה",
-            data=result_bytes,
-            file_name="תוצאת_התאמת_שקים.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            st.download_button(
+                label="⬇ הורדת קובץ תוצאה",
+                data=result_bytes,
+                file_name="תוצאת_התאמת_שקים.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"שגיאה במהלך ההתאמה: {e}")
